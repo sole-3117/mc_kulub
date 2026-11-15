@@ -1,4 +1,7 @@
 import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import LinkPreviewOptions, Update
@@ -19,6 +22,30 @@ from handlers import extras, onboarding, submissions, tasks
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("mc_club_bot")
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path not in ("/", "/health"):
+            self.send_error(404)
+            return
+
+        body = b"MC Club Bot is running!"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:
+        pass  # HTTP health-check so'rovlarini logga yozmaymiz.
+
+
+def start_health_server() -> None:
+    port = int(os.environ.get("PORT", "8080"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    threading.Thread(target=server.serve_forever, daemon=True, name="health-server").start()
+    log.info("Health server 0.0.0.0:%s da ishga tushdi", port)
 
 
 async def post_init(app: Application) -> None:
@@ -93,6 +120,7 @@ def build_application() -> Application:
 
 
 def main() -> None:
+    start_health_server()
     db.init()
     build_application().run_polling(allowed_updates=Update.ALL_TYPES)
 
