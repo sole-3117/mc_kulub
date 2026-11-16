@@ -4,7 +4,9 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import ChatMemberUpdatedFilter, Command, IS_MEMBER, IS_NOT_MEMBER
@@ -12,20 +14,21 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     ChatPermissions,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ErrorEvent,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 # ==========================================
-# 1. MUHIT O'ZGARUVCHILARI VA LOGGING
+# 1. MUHIT O'ZGARUVCHILARI VA VAQT MINTAQASI
 # ==========================================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+TZ = ZoneInfo("Asia/Tashkent")
 
 if not BOT_TOKEN or not OWNER_ID:
     raise ValueError("XATO: .env faylida BOT_TOKEN va OWNER_ID ko'rsatilishi shart!")
@@ -44,9 +47,14 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=TZ)
 
-DB_PATH = "mc_club.db"
+DB_PATH = os.getenv("DB_PATH", "mc_club.db")
+
+
+def now_uz() -> datetime:
+    """O'zbekiston joriy vaqtini qaytaradi"""
+    return datetime.now(TZ).replace(tzinfo=None)
 
 
 # ==========================================
@@ -62,24 +70,20 @@ def get_db():
 def init_db():
     with get_db() as conn:
         c = conn.cursor()
-        # Dinamik sozlamalar jadvali (group_id, channel_id, default_doc)
         c.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
-        # Admin va mentorlar jadvali
         c.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
                 added_at TEXT
             )
         """)
-        # Asosiy egani adminlar ro'yxatiga qo'shish
         c.execute("INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, datetime('now'))", (OWNER_ID,))
 
-        # A'zolar jadvali
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -89,7 +93,6 @@ def init_db():
                 is_active INTEGER DEFAULT 1
             )
         """)
-        # Topshiriqlar jadvali
         c.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +102,6 @@ def init_db():
                 is_closed INTEGER DEFAULT 0
             )
         """)
-        # Topshirilgan vazifalar
         c.execute("""
             CREATE TABLE IF NOT EXISTS submissions (
                 user_id INTEGER,
@@ -108,7 +110,6 @@ def init_db():
                 PRIMARY KEY (user_id, task_id)
             )
         """)
-        # Sababli kechikishlar (Uzr)
         c.execute("""
             CREATE TABLE IF NOT EXISTS excuses (
                 user_id INTEGER,
@@ -121,7 +122,6 @@ def init_db():
         conn.commit()
 
 
-# Bazadan sozlamalarni o'qish va yozish funksiyalari
 def get_setting(key: str, default: str = None) -> str:
     with get_db() as conn:
         c = conn.cursor()
@@ -191,7 +191,6 @@ MUTE_PERMISSIONS = ChatPermissions(can_send_messages=False)
 
 
 async def safe_send(chat_id: int | str, text: str, reply_markup=None) -> types.Message | None:
-    """Xatolik chiqarmasdan xavfsiz xabar yuborish"""
     if not chat_id:
         return None
     try:
@@ -213,7 +212,6 @@ async def safe_send(chat_id: int | str, text: str, reply_markup=None) -> types.M
         return None
 
 
-# Global xatoliklarni ushlash (Serverda bot to'xtab qolmasligi uchun)
 @dp.error()
 async def global_error_handler(event: ErrorEvent):
     logger.exception(f"Global xatolik yuz berdi: {event.exception}")
@@ -234,7 +232,6 @@ class SetupStates(StatesGroup):
 def get_panel_kb() -> InlineKeyboardMarkup:
     group_status = "✅ Ulangan" if get_group_id() else "❌ Ulanmagan"
     channel_status = get_channel_id() or "❌ Ulanmagan"
-    doc_status = get_setting("default_doc", "Kiritilmagan")
 
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Yangi vazifa e'lon qilish", callback_data="panel:new_task")],
@@ -262,8 +259,9 @@ async def cmd_panel(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return await message.answer(
             "🤖 <b>MC Club Nazoratchi Boti</b>\n\n"
-            "Vazifa topshirish uchun xabaringizga <b>#vazifa</b> xeshtegini qo'shib yuboring.\n"
-            "Sababli kechikish uchun: <code>/uzr sabab</code>",
+            "• Vazifa topshirish uchun xabaringizga <b>#vazifa</b> xeshtegini qo'shib yuboring.\n"
+            "• Sababli kechikish uchun: <code>/uzr sabab</code>\n"
+            "• Qoidalar va joriy dedlaynni ko'rish: /qoidalar",
             parse_mode="HTML"
         )
 
@@ -277,13 +275,13 @@ async def cmd_panel(message: types.Message, state: FSMContext):
         f"🔹 <b>Ulangan guruh ID:</b> <code>{group_id}</code>\n"
         f"🔹 <b>Ulangan kanal:</b> <code>{html.escape(channel_id)}</code>\n"
         f"🔹 <b>Asosiy qo'llanma:</b> {doc_url}\n"
-        f"🔹 <b>Adminlar ID:</b> <code>{admins_list}</code>\n\n"
+        f"🔹 <b>Adminlar ID:</b> <code>{admins_list}</code>\n"
+        f"🕒 <b>Server vaqti (UZ):</b> <code>{now_uz().strftime('%Y-%m-%d %H:%M')}</code>\n\n"
         "💡 <i>Guruhni ulash uchun botni guruhga Admin qilib qo'shing va guruh ichida <code>/set_group</code> buyrug'ini yozing.</i>"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_panel_kb(), disable_web_page_preview=True)
 
 
-# Guruh ichida yozib guruhni avtomatik bog'lash
 @router.message(Command("set_group"))
 async def cmd_set_group(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -547,8 +545,9 @@ async def process_doc(message: types.Message, state: FSMContext):
         return await message.answer("❌ Havolani matn ko'rinishida yuboring:")
     await state.update_data(doc_url=message.text.strip())
     await message.answer(
-        "⏰ Dedlayn vaqtini kiriting.\n"
-        "Format: <code>YYYY-MM-DD HH:MM</code> (Masalan: <code>2026-11-20 21:00</code>)",
+        "⏰ Dedlayn vaqtini kiriting (O'zbekiston vaqti bilan).\n"
+        f"Hozirgi vaqt: <code>{now_uz().strftime('%Y-%m-%d %H:%M')}</code>\n"
+        "Format: <code>YYYY-MM-DD HH:MM</code>",
         parse_mode="HTML"
     )
     await state.set_state(TaskCreation.waiting_for_deadline)
@@ -560,7 +559,7 @@ async def process_deadline(message: types.Message, state: FSMContext):
         return
     try:
         deadline_dt = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
-        if deadline_dt <= datetime.now():
+        if deadline_dt <= now_uz():
             return await message.answer("❌ Dedlayn vaqti hozirgi vaqtdan keyin bo'lishi kerak!")
     except ValueError:
         return await message.answer("❌ Format xato! Namuna: <code>2026-11-20 21:00</code>", parse_mode="HTML")
@@ -581,7 +580,7 @@ async def process_deadline(message: types.Message, state: FSMContext):
     scheduler.add_job(
         check_deadline,
         trigger="date",
-        run_date=deadline_dt,
+        run_date=deadline_dt.replace(tzinfo=TZ),
         args=[task_id],
         id=f"task_{task_id}",
         replace_existing=True
@@ -596,7 +595,6 @@ async def process_deadline(message: types.Message, state: FSMContext):
         f"<b>#vazifa</b> xeshtegi bilan guruhga yoki botning o'ziga yuboring.</i>"
     )
 
-    # Guruhga va (agar ulangan bo'lsa) Kanalga e'lon yuborish
     await safe_send(get_group_id(), announcement)
     channel_id = get_channel_id()
     if channel_id:
@@ -646,7 +644,6 @@ async def handle_submission(message: types.Message):
             reply_markup=kb
         )
     else:
-        # Lichkadan yuborilsa, asosiy adminga uzatiladi
         try:
             await message.forward(chat_id=OWNER_ID)
         except Exception:
@@ -701,7 +698,7 @@ async def request_excuse(message: types.Message):
     task_id, _, _, deadline_str = task
     deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
 
-    if datetime.now() > deadline_dt - timedelta(hours=12):
+    if now_uz() > deadline_dt - timedelta(hours=12):
         return await message.reply(
             "❌ Uzr so'rash muddati o'tgan! Qoidaga ko'ra dedlayndan kamida 12 soat oldin yozish kerak."
         )
@@ -765,7 +762,7 @@ async def review_excuse(call: types.CallbackQuery):
 
 
 # ==========================================
-# 9. "QO'LLANMANI O'QI" TEZKOR JAVOB (/read va /doc)
+# 9. QO'LLANMA VA QOIDALAR (/read, /doc, /qoidalar)
 # ==========================================
 @router.message(Command("read", "doc"))
 async def quick_doc_reply(message: types.Message):
@@ -788,6 +785,24 @@ async def quick_doc_reply(message: types.Message):
         pass
 
 
+@router.message(Command("qoidalar", "shartlar", "help"))
+async def send_rules_and_guide(message: types.Message):
+    task = get_active_task()
+    current_doc = task[2] if task else get_setting("default_doc", "Kiritilmagan")
+    deadline_info = f"{task[3]} (#{task[0]}-vazifa)" if task else "Hozircha faol vazifa yo'q"
+
+    text = (
+        "🤖 <b>MC Club — Qoidalar va Qo'llanma</b>\n\n"
+        "1️⃣ <b>Vazifa topshirish:</b> Ishingizni (link, fayl yoki rasm) <code>#vazifa</code> xeshtegi bilan yuboring.\n"
+        "2️⃣ <b>Sababli kechikish:</b> Dedlayndan kamida 12 soat oldin <code>/uzr sabab</code> ko'rinishida yozing.\n"
+        "3️⃣ <b>3 ta Strike qoidasi:</b> 3 marta vazifa bajarmagan a'zo guruhdan avtomatik chiqariladi.\n"
+        "4️⃣ <b>Ro'yxatdan o'tish:</b> Bazaga kirish uchun <code>/reg</code> buyrug'ini yozing.\n\n"
+        f"📚 <b>Joriy qo'llanma:</b> {html.escape(current_doc)}\n"
+        f"⏳ <b>Joriy dedlayn:</b> {deadline_info}"
+    )
+    await message.reply(text, parse_mode="HTML", disable_web_page_preview=True)
+
+
 # ==========================================
 # 10. DEDLAYN TEKSHIRUVI VA AVTO-KICK (3 STRIKE)
 # ==========================================
@@ -807,13 +822,11 @@ async def check_deadline(task_id: int):
             if user_id in admin_ids:
                 continue
 
-            # Vazifa tasdiqlanganmi?
             c.execute("SELECT status FROM submissions WHERE user_id = ? AND task_id = ?", (user_id, task_id))
             sub = c.fetchone()
             if sub and sub[0] == "approved":
                 continue
 
-            # Uzri qabul qilinganmi?
             c.execute("SELECT status FROM excuses WHERE user_id = ? AND task_id = ?", (user_id, task_id))
             exc = c.fetchone()
             if exc and exc[0] == "approved":
@@ -850,7 +863,7 @@ async def check_deadline(task_id: int):
 
 
 # ==========================================
-# 11. ISHGA TUSHIRISH VA TAYMERLARNI TIKLASH
+# 11. RENDER UCHUN WEB-SERVER VA ISHGA TUSHIRISH
 # ==========================================
 def restore_scheduled_tasks():
     with get_db() as conn:
@@ -861,11 +874,11 @@ def restore_scheduled_tasks():
     for task_id, deadline_str in open_tasks:
         try:
             deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
-            if deadline_dt > datetime.now():
+            if deadline_dt > now_uz():
                 scheduler.add_job(
                     check_deadline,
                     trigger="date",
-                    run_date=deadline_dt,
+                    run_date=deadline_dt.replace(tzinfo=TZ),
                     args=[task_id],
                     id=f"task_{task_id}",
                     replace_existing=True
@@ -876,10 +889,28 @@ def restore_scheduled_tasks():
             logger.error(f"Taymerni tiklashda xato (task {task_id}): {e}")
 
 
+async def health_check(request):
+    return web.Response(text="MC Club Nazoratchi Bot 24/7 ishlamoqda!")
+
+
+async def start_web_server():
+    """Render.com Web Service port tekshiruvidan o'tishi uchun mini-server"""
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Render uchun Web-port muvaffaqiyatli ochildi: {port}")
+
+
 async def main():
     init_db()
     scheduler.start()
     restore_scheduled_tasks()
+    await start_web_server()
     logger.info("MC Club Bot serverda muvaffaqiyatli ishga tushdi!")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
